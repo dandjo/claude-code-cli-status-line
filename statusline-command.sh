@@ -1,4 +1,5 @@
 #!/bin/bash
+# SPDX-License-Identifier: 0BSD
 # Claude Code status line.
 # Line 1: model + effort, folder icon + working dir (colored like the ~/.bashrc prompt), git branch.
 # Line 2: context-window usage bar, tokens in context with the session cost, elapsed time.

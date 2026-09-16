@@ -139,3 +139,8 @@ further out to see the countdown switch to days.
 
 The full payload schema is documented at
 <https://code.claude.com/docs/en/statusline>.
+
+## License
+
+[0BSD](LICENSE). Use it, change it, ship it. No attribution required, so the
+copy in your `~/.claude` carries no obligations at all.

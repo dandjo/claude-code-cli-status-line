@@ -11,6 +11,13 @@
 
 input=$(cat)
 
+# Every field comes out of the payload through jq; without it the line would read all zeros, so it names
+# what is missing instead.
+if ! command -v jq > /dev/null; then
+    printf 'Status line needs jq: apt install jq / brew install jq\n'
+    exit 0
+fi
+
 MODEL=$(echo "$input" | jq -r '.model.display_name // empty')
 EFFORT=$(echo "$input" | jq -r '.effort.level // empty')
 COST=$(echo "$input" | jq -r '.cost.total_cost_usd // 0')
@@ -240,7 +247,9 @@ fi
 
 printf "%b%s📂 \033[01;34m%s\033[00m%b\n" "$MODEL_FMT" "$chroot_prefix" "$dir" "$BRANCH"
 
-COST_FMT=$(LC_ALL=C printf '$%.2f' "$COST" 2>/dev/null || echo '$0.00')
+# printf prints $0.00 for a value that is not a number and still fails, so the fallback replaces its output
+# instead of being appended to it.
+COST_FMT=$(LC_ALL=C printf '$%.2f' "$COST" 2>/dev/null) || COST_FMT='$0.00'
 # The token count is cyan like the reset time on the limit lines, the cost amber like their countdown.
 printf "%b | 🪙 Tokens %b%s%b (%b%s%b) | ⏳ %sm %ss\n" "$(render_bar Context "$PCT")" "$CYAN" "$(fmt_tokens "$TOKENS")" "$RESET" "$MONEY" "$COST_FMT" "$RESET" "$MINS" "$SECS"
 

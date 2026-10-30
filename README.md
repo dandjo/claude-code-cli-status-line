@@ -1,13 +1,15 @@
 # Claude Code status line
 
 A multi-line status line for [Claude Code](https://code.claude.com) that keeps
-the four things you actually look up while working on screen: which model you
-are talking to, where you are, how full the context window is, and how much of
-your subscription limits is left before each window resets.
+the things you actually look up while working on screen: which model you are
+talking to, where you are, how full the context window is, how much of your
+subscription limits is left before each window resets, and what extra usage
+credits you have spent this month.
 
 ![The status line rendered in a terminal](assets/preview.svg)
 
-One Bash script, no dependencies beyond `jq`, nothing to configure.
+One Bash script, no dependencies beyond `jq` (and `curl` for the credits
+line), nothing to configure.
 
 ## What it shows
 
@@ -18,6 +20,7 @@ One Bash script, no dependencies beyond `jq`, nothing to configure.
 | `5h`      | The rolling five-hour subscription window                             |
 | `7d`      | The weekly subscription window                                        |
 | per model | A model-scoped weekly window, labelled with the model name            |
+| `Credits` | Usage credits spent this month, against the monthly limit if set      |
 
 The working directory is shortened to `~` like a shell prompt, and the branch
 disappears outside a git repository. The effort level is only shown for models
@@ -46,11 +49,43 @@ The countdown drops the leading units that are zero, so it reads `in 14m`,
 
 Colour carries the same meaning everywhere: cyan for a value you read (the
 model, the token count, the reset time), amber for anything that costs you
-(session cost, effort level, the countdown).
+(session cost, effort level, the countdown, credits spent).
+
+## The credits line
+
+Usage credits are the extra usage you can buy on top of a Claude.ai plan. The
+line shows them while they are turned on, or once anything was spent this
+month:
+
+| Monthly limit | Shown as                                              |
+| :------------ | :---------------------------------------------------- |
+| set           | a bar like the limit lines, then `💳 €120.98 of €200.00` |
+| none          | a grey `no limit` bar, then `💳 €120.98 this month`     |
+
+`· off` follows while the credits are turned off, and `· as of 14:30` once the
+figure is more than ten minutes old.
+
+The status-line payload does not carry these figures for a Claude.ai sign-in,
+so the script asks the same endpoint Claude Code's `/usage` dialog reads
+(`api.anthropic.com/api/oauth/usage`). That is the one network request the
+script makes:
+
+- It runs in the background at most every two minutes, and a render never
+  waits for it; the line shows the last answer, cached in
+  `~/.cache/claude-statusline/usage-credits.json`.
+- It uses Claude Code's OAuth access token from
+  `~/.claude/.credentials.json`. The token goes to `curl` on stdin, so it
+  never shows up in the process list, and it is never written to the cache.
+- An expired token is left alone. Refreshing it would rotate the refresh
+  token behind Claude Code's back, so the line waits until Claude Code has
+  renewed it on its next request.
+- On macOS Claude Code keeps the credentials in the Keychain rather than in
+  that file, so the line stays away there.
 
 ## Requirements
 
 - Bash, and `jq` to parse the status-line JSON (`apt install jq`, `brew install jq`)
+- `curl` for the credits line; without it the line stays away
 - A terminal with truecolor support for the exact amber; without it the script falls back to ANSI yellow
 - GNU or BSD `date` — both are handled, so Linux and macOS work the same
 
@@ -107,7 +142,9 @@ Everything worth changing sits at the top of the script:
 
 - `BAR_WIDTH` is the bar length in characters, 20 by default
 - `CYAN`, `GREEN`, `YELLOW`, `RED` are plain ANSI codes
-- `MONEY` is the amber used for cost, effort, and the countdown, matching the colour Claude Code's own dark theme uses for its mode indicator
+- `MONEY` is the amber used for cost, effort, the countdown, and credits spent, matching the colour Claude Code's own dark theme uses for its mode indicator
+- `NO_LIMIT` is the grey of the `no limit` bar on the credits line
+- `CREDITS_TTL` is how often the credits are fetched, 120 seconds by default, and `CREDITS_STALE` when the line starts to say `as of`, 600 seconds
 - the two thresholds that colour a bar live in `render_bar`, at 70 and 90
 
 The layout of each line is a single `printf` near the bottom of the file, so
@@ -126,6 +163,21 @@ echo '{"model":{"display_name":"Opus 5"},"cost":{"total_cost_usd":1.23,"total_du
 Vary `used_percentage` to see the colour thresholds, and move `resets_at`
 further out to see the countdown switch to days.
 
+The credits line reads only its cache. To see it without a network request,
+point the script at a scratch cache and config directory and write the cache
+yourself (amounts are in cents):
+
+```bash
+dir=$(mktemp -d); mkdir -p "$dir/cache/claude-statusline"
+date +%s > "$dir/cache/claude-statusline/.attempt"
+echo '{"fetched_at":'"$(date +%s)"',"is_enabled":true,"used_credits":12098,"monthly_limit":20000,"decimal_places":2,"currency":"EUR"}' \
+  > "$dir/cache/claude-statusline/usage-credits.json"
+echo '{"model":{"display_name":"Opus 5"}}' \
+  | XDG_CACHE_HOME="$dir/cache" CLAUDE_CONFIG_DIR="$dir" bash statusline-command.sh
+```
+
+Drop `monthly_limit` to see the `no limit` bar.
+
 ## When something looks wrong
 
 | Symptom                                | Cause                                                                                    |
@@ -134,6 +186,8 @@ further out to see the countdown switch to days.
 | Every value is `0`                     | `jq` is not installed                                                                      |
 | No `5h` / `7d` lines                   | Expected on API-key accounts — those windows only exist for Claude.ai subscriptions         |
 | No per-model line                      | Expected — the CLI does not send `rate_limits.model_scoped` to the status line yet          |
+| No `Credits` line                      | Credits are off and nothing was spent, `curl` is missing, or you are on macOS (Keychain)    |
+| `Credits` line says `as of …`          | The last fetch failed or the token expired; it catches up after Claude Code's next request  |
 | Cost and effort level are plain yellow | The terminal does not report truecolor, so the script falls back to ANSI yellow              |
 | Boxes instead of icons                 | The terminal font has no emoji coverage; replace the icons in the `printf` calls            |
 

@@ -8,7 +8,7 @@ credits you have spent this month.
 
 ![The status line rendered in a terminal](assets/preview.svg)
 
-One Bash script, no dependencies beyond `jq` (and `curl` for the credits
+One Bash script, no dependencies beyond Python 3 (and `curl` for the credits
 line), nothing to configure.
 
 ## What it shows
@@ -84,7 +84,7 @@ script makes:
 
 ## Requirements
 
-- Bash, and `jq` to parse the status-line JSON (`apt install jq`, `brew install jq`)
+- Bash, and Python 3.8 or newer to parse the status-line JSON, standard library only (`apt install python3`; on macOS it comes with the Command Line Tools, `xcode-select --install`)
 - `curl` for the credits line; without it the line stays away
 - A terminal with truecolor support for the exact amber; without it the script falls back to ANSI yellow
 - GNU or BSD `date` — both are handled, so Linux and macOS work the same
@@ -130,8 +130,8 @@ https://github.com/dandjo/claude-code-cli-status-line
 2. Ensure ~/.claude/settings.json contains:
      "statusLine": { "type": "command", "command": "bash ~/.claude/statusline-command.sh" }
    Add the key if it is missing; leave every other setting untouched.
-3. The script needs jq. If it is not installed, tell me the install command
-   for my system instead of installing it yourself.
+3. The script needs python3. If it is not installed, tell me the install
+   command for my system instead of installing it yourself.
 4. Feed a sample status-line payload into the script and show me the rendered
    output, including the 5h and 7d lines, so I can see it works.
 ```
@@ -183,7 +183,7 @@ Drop `monthly_limit` to see the `no limit` bar.
 | Symptom                                | Cause                                                                                    |
 | :------------------------------------- | :---------------------------------------------------------------------------------------- |
 | No status line at all                  | `statusLine` missing from `~/.claude/settings.json`, or the path in `command` does not exist |
-| `Status line needs jq` instead of the line | `jq` is not installed; install it with the command shown                             |
+| `Status line needs python3` instead of the line | Python 3 is not installed; install it with the command shown                     |
 | No `5h` / `7d` lines                   | Expected on API-key accounts — those windows only exist for Claude.ai subscriptions         |
 | No per-model line                      | Expected — the CLI does not send `rate_limits.model_scoped` to the status line yet          |
 | No `Credits` line                      | Credits are off and nothing was spent, `curl` is missing, or you are on macOS (Keychain)    |

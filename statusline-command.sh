@@ -4,8 +4,8 @@
 # Line 1: model + effort, folder icon + working dir (colored like the ~/.bashrc prompt), git branch.
 # Line 2: context-window usage bar, tokens in context with the session cost, elapsed time.
 # Lines 3+: Claude.ai subscription limits (5h / 7d) with the local time each window resets, only when the
-#           API reports them, followed by one line per model-scoped weekly window (e.g. Fable) if the
-#           payload carries `rate_limits.model_scoped`.
+#           API reports them, followed by one line per model-scoped weekly window (e.g. Fable), from the
+#           payload's `rate_limits.model_scoped` or else the usage endpoint.
 # Last line: usage credits (extra usage bought on top of the plan) spent this month, while they are enabled
 #           or anything was spent.
 
@@ -100,12 +100,17 @@ def field(payload, path, default=None):
     return "" if value is None else raw(value)
 
 
-def model_scoped(payload):
-    """(.rate_limits.model_scoped // [])[] | select(.display_name != null)
-    | [.display_name, ((.used_percentage // .utilization // 0) | floor), (.resets_at // "")] | @tsv"""
+def load(path):
+    with open(path, encoding="utf-8") as handle:
+        return parse(handle.read())
+
+
+def model_scoped(document, path, fetched=0):
+    """(<path> // [])[] | select(.display_name != null)
+    | [.display_name, ((.used_percentage // .utilization // 0) | floor), <fetched>, (.resets_at // "")] | @tsv"""
     lines = []
     try:
-        windows = alt(get(payload, "rate_limits.model_scoped"), [])
+        windows = alt(get(document, path), [])
         if isinstance(windows, dict):
             windows = list(windows.values())
         elif not isinstance(windows, list):
@@ -114,18 +119,41 @@ def model_scoped(payload):
             if get(window, "display_name") is None:
                 continue
             percent = alt(alt(get(window, "used_percentage"), get(window, "utilization")), 0)
-            lines.append(tsv([window["display_name"], floor(percent), alt(get(window, "resets_at"), "")]))
+            lines.append(tsv([window["display_name"], floor(percent), fetched, alt(get(window, "resets_at"), "")]))
     except JqError:
         pass
     return "\n".join(lines)
+
+
+def cached_model_scoped(path):
+    """The usage cache's windows, stamped with the time of its answer."""
+    try:
+        cache = load(path)
+        return model_scoped(cache, "model_scoped", floor(alt(get(cache, "fetched_at"), 0)))
+    except (OSError, ValueError, JqError):
+        return ""
+
+
+def scoped_limits(answer):
+    """The rows of limits[] the CLI's get_usage takes for per-model windows, in the form of
+    rate_limits.model_scoped. A malformed row costs the windows, never the credits."""
+    windows = []
+    try:
+        for limit in alt(get(answer, "limits"), []):
+            name = get(limit, "scope.model.display_name")
+            if get(limit, "kind") == "weekly_scoped" and isinstance(name, str):
+                windows.append({"display_name": name, "used_percentage": get(limit, "percent"),
+                                "resets_at": get(limit, "resets_at")})
+    except (JqError, TypeError):
+        return []
+    return windows
 
 
 def credits(path):
     """[(.is_enabled // false), (.used_credits // 0 | floor), (.monthly_limit // 0 | floor),
     (.decimal_places // 2), (.currency // "USD"), (.fetched_at // 0)] | @tsv"""
     try:
-        with open(path, encoding="utf-8") as handle:
-            cache = parse(handle.read())
+        cache = load(path)
         return tsv([
             alt(get(cache, "is_enabled"), False), floor(alt(get(cache, "used_credits"), 0)),
             floor(alt(get(cache, "monthly_limit"), 0)), alt(get(cache, "decimal_places"), 2),
@@ -136,8 +164,7 @@ def credits(path):
 
 
 def oauth(path):
-    with open(path, encoding="utf-8") as handle:
-        return get(parse(handle.read()), "claudeAiOauth")
+    return get(load(path), "claudeAiOauth")
 
 
 def main(mode, args):
@@ -155,7 +182,8 @@ def main(mode, args):
             ("rate_limits.seven_day.resets_at", None),
         ):
             values.append("" if payload is JqError else field(payload, path, default))
-        values.append("" if payload is JqError else model_scoped(payload))
+        windows = "" if payload is JqError else model_scoped(payload, "rate_limits.model_scoped")
+        values.append(windows or (cached_model_scoped(args[0]) if args else ""))
         values.append("" if payload is JqError else field(payload, "workspace.current_dir"))
         values.append(credits(args[0]) if args else "")
         sys.stdout.write("".join(value.replace("\0", "").rstrip("\n") + "\0" for value in values))
@@ -173,10 +201,12 @@ def main(mode, args):
         sys.stdout.write('header = "Authorization: Bearer %s"\n' % token.replace("\\", "\\\\").replace('"', '\\"'))
         return 0
     if mode == "credits-cache":
-        extra = get(parse(sys.stdin.read()), "extra_usage")
+        answer = parse(sys.stdin.read())
+        extra = get(answer, "extra_usage")
         if not isinstance(extra, dict):
             return 1
-        sys.stdout.write(json.dumps({"fetched_at": math.floor(time.time()), **extra}, indent=2, ensure_ascii=False) + "\n")
+        cache = {"fetched_at": math.floor(time.time()), **extra, "model_scoped": scoped_limits(answer)}
+        sys.stdout.write(json.dumps(cache, indent=2, ensure_ascii=False) + "\n")
         return 0
     return 2
 
@@ -187,18 +217,19 @@ except (OSError, ValueError, JqError, IndexError):
     sys.exit(1)
 PY
 
-# Usage-credits cache, kept by refresh_credits below and read with the payload fields.
+# Usage cache (credits and per-model windows), kept by refresh_credits below and read with the payload fields.
 CREDITS_TTL=120
 CREDITS_STALE=600
 CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/claude-statusline"
 CREDITS_CACHE="$CACHE_DIR/usage-credits.json"
 CREDENTIALS="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/.credentials.json"
 
-# MODEL_SCOPED: the per-model weekly windows, one TAB-separated line each: display_name, percent,
-# resets_at. Not in the documented status-line payload yet (CLI 2.1.263 only sends it on the SDK
-# `get_usage` request, where it is `display_name` + `utilization` 0-100 + ISO 8601 `resets_at`). Both
-# field spellings and both timestamp forms are accepted so the block lights up unchanged once the field
-# arrives. CREDITS: the credits cache as one TAB-separated line, read by render_credits.
+# MODEL_SCOPED: the per-model weekly windows, one TAB-separated line each: display_name, percent, the time
+# of the cached answer (0 from the payload), resets_at. Not in the status-line payload yet (CLI 2.1.319 only
+# sends it on the SDK `get_usage` request, where it is `display_name` + `utilization` 0-100 + ISO 8601
+# `resets_at`), so they come from the usage cache. Both field spellings and both timestamp forms are accepted
+# so the payload takes over unchanged once the field arrives. CREDITS: the credits cache as one TAB-separated
+# line, read by render_credits.
 {
     IFS= read -r -d '' MODEL; IFS= read -r -d '' EFFORT; IFS= read -r -d '' COST
     IFS= read -r -d '' PCT; IFS= read -r -d '' TOKENS; IFS= read -r -d '' DURATION_MS
@@ -321,11 +352,12 @@ render_bar() {
 
 # Usage credits. The status-line payload carries them only on the Cloud gateway lane
 # (`rate_limits.spend_limit`), so for a claude.ai sign-in the script reads `extra_usage` from the same
-# /api/oauth/usage endpoint Claude Code's /usage dialog uses. The answer is cached and refreshed in the
-# background at most every CREDITS_TTL seconds, so a render never waits on the network. The OAuth access
-# token goes to curl on stdin, never on the command line and never into the cache. An expired token is
-# left alone: refreshing it here would rotate the refresh token behind Claude Code's back. macOS keeps
-# the credentials in the Keychain instead of the file, so the line stays off there.
+# /api/oauth/usage endpoint Claude Code's /usage dialog uses; its `limits[]` also supply the per-model
+# windows the payload lacks. The answer is cached and refreshed in the background at most every CREDITS_TTL
+# seconds, so a render never waits on the network. The OAuth access token goes to curl on stdin, never on
+# the command line and never into the cache. An expired token is left alone: refreshing it here would rotate
+# the refresh token behind Claude Code's back. macOS keeps the credentials in the Keychain instead of the
+# file, so these lines stay off there.
 fetch_credits() {
     local tmp
     set -o pipefail
@@ -362,11 +394,16 @@ fmt_money() {
     LC_ALL=C awk -v n="$1" -v d="$2" -v s="$sym" 'BEGIN { printf "%s%.*f", s, d, n / 10 ^ d }'
 }
 
+# as_of <unix_epoch_seconds> -> " · as of 14:30" once that cached answer is older than CREDITS_STALE
+as_of() {
+    [ $(($(date +%s) - $1)) -gt "$CREDITS_STALE" ] && printf ' · as of %s' "$(fmt_local "$1" '%H:%M')"
+}
+
 # render_credits -> "Credits no limit | 💳 €120.98 this month" without a monthly limit, or the bar with
 # "| 💳 €120.98 of €200.00" when one is set; "· off" while credits cannot cover sends, "· as of 14:30"
 # once the cached answer is older than CREDITS_STALE.
 render_credits() {
-    local enabled used limit places currency fetched pct now lpad rpad stale=""
+    local enabled used limit places currency fetched pct lpad rpad stale
     [ -r "$CREDITS_CACHE" ] || return 0
     # No field may be empty: TAB is IFS whitespace, so `read` would merge an empty one into its neighbour.
     # A monthly limit of 0 therefore stands for "none".
@@ -374,8 +411,7 @@ render_credits() {
     [ -z "$enabled" ] && return 0
     [ "$enabled" != true ] && [ "${used:-0}" -eq 0 ] && return 0
 
-    now=$(date +%s)
-    [ $((now - fetched)) -gt "$CREDITS_STALE" ] && stale=" · as of $(fmt_local "$fetched" '%H:%M')"
+    stale=$(as_of "$fetched")
     [ "$enabled" != true ] && stale=" · ${RED}off${RESET}$stale"
 
     if [ "$limit" -gt 0 ]; then
@@ -419,11 +455,14 @@ printf "%b | 🪙 Tokens %b%s%b (%b%s%b) | ⏳ %sm %ss\n" "$(render_bar Context 
 # Subscription limits: only present for Claude.ai subscribers, per window
 [ -n "$FIVE_H" ]  && printf "%b\n" "$(render_bar '5h' "$FIVE_H" "$FIVE_H_RESET")"
 [ -n "$SEVEN_D" ] && printf "%b\n" "$(render_bar '7d' "$SEVEN_D" "$SEVEN_D_RESET")"
-# Model-scoped weekly windows (e.g. Fable), labelled with the server-supplied model name
+# Model-scoped weekly windows (e.g. Fable), labelled with the server-supplied model name. A cached one says
+# how old it is, like the credits.
 if [ -n "$MODEL_SCOPED" ]; then
-    while IFS=$'\t' read -r ms_name ms_pct ms_reset; do
+    while IFS=$'\t' read -r ms_name ms_pct ms_fetched ms_reset; do
         [ -z "$ms_name" ] && continue
-        printf "%b\n" "$(render_bar "$ms_name" "$ms_pct" "$ms_reset")"
+        ms_stale=""
+        [ "$ms_fetched" -gt 0 ] && ms_stale=$(as_of "$ms_fetched")
+        printf "%b%s\n" "$(render_bar "$ms_name" "$ms_pct" "$ms_reset")" "$ms_stale"
     done <<< "$MODEL_SCOPED"
 fi
 # Usage credits from the cache refresh_credits keeps

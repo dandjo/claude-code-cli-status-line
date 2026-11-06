@@ -9,7 +9,7 @@ credits you have spent this month.
 ![The status line rendered in a terminal](assets/preview.svg)
 
 One Bash script, no dependencies beyond Python 3 (and `curl` for the credits
-line), nothing to configure.
+and per-model lines), nothing to configure.
 
 ## What it shows
 
@@ -27,9 +27,7 @@ disappears outside a git repository. The effort level is only shown for models
 that support it.
 
 The `5h` and `7d` lines need a Claude.ai subscription. On an API-key account
-those windows do not exist and the lines stay away. The per-model line appears
-only once the payload carries `rate_limits.model_scoped`, which the CLI does
-not send to the status line yet. The block is in place for when it does.
+those windows do not exist and the lines stay away.
 
 ## Reading the limit lines
 
@@ -82,10 +80,28 @@ script makes:
 - On macOS Claude Code keeps the credentials in the Keychain rather than in
   that file, so the line stays away there.
 
+## The per-model lines
+
+A plan can limit a model on a weekly window of its own, such as Fable. Each
+window gets a line labelled with the model name, in the form of the limit lines
+above. It shows as soon as the server reports the window, at 0% too, so its
+reset stays in view even if you do not use that model.
+
+Claude Code does not hand these windows to the status line yet: it keeps
+`rate_limits.model_scoped` for the SDK's `get_usage` request. So the script reads
+them from the same answer as the credits, the rows of `limits[]` of kind
+`weekly_scoped` with a model name, and all of the above applies: no extra
+request, up to two minutes old, no line on macOS. `· as of 14:30` follows once
+the answer is more than ten minutes old. If the payload carries the field one
+day, it takes over without a change to the script.
+
+The endpoint is undocumented, so its fields may change. The lines then
+disappear; the rest of the status line stays.
+
 ## Requirements
 
 - Bash, and Python 3.8 or newer to parse the status-line JSON, standard library only (`apt install python3`; on macOS it comes with the Command Line Tools, `xcode-select --install`)
-- `curl` for the credits line; without it the line stays away
+- `curl` for the credits and per-model lines; without it they stay away
 - A terminal with truecolor support for the exact amber; without it the script falls back to ANSI yellow
 - GNU or BSD `date` — both are handled, so Linux and macOS work the same
 
@@ -144,7 +160,7 @@ Everything worth changing sits at the top of the script:
 - `CYAN`, `GREEN`, `YELLOW`, `RED` are plain ANSI codes
 - `MONEY` is the amber used for cost, effort, the countdown, and credits spent, matching the colour Claude Code's own dark theme uses for its mode indicator
 - `NO_LIMIT` is the grey of the `no limit` bar on the credits line
-- `CREDITS_TTL` is how often the credits are fetched, 120 seconds by default, and `CREDITS_STALE` when the line starts to say `as of`, 600 seconds
+- `CREDITS_TTL` is how often the credits and per-model windows are fetched, 120 seconds by default, and `CREDITS_STALE` when their lines start to say `as of`, 600 seconds
 - the two thresholds that colour a bar live in `render_bar`, at 70 and 90
 
 The layout of each line is a single `printf` near the bottom of the file, so
@@ -176,7 +192,9 @@ echo '{"model":{"display_name":"Opus 5"}}' \
   | XDG_CACHE_HOME="$dir/cache" CLAUDE_CONFIG_DIR="$dir" bash statusline-command.sh
 ```
 
-Drop `monthly_limit` to see the `no limit` bar.
+Drop `monthly_limit` to see the `no limit` bar. Add
+`"model_scoped":[{"display_name":"Fable","used_percentage":95,"resets_at":"2030-01-01T18:00:00+00:00"}]`
+to the cache to see a per-model line.
 
 ## When something looks wrong
 
@@ -185,9 +203,9 @@ Drop `monthly_limit` to see the `no limit` bar.
 | No status line at all                  | `statusLine` missing from `~/.claude/settings.json`, or the path in `command` does not exist |
 | `Status line needs python3` instead of the line | Python 3 is not installed; install it with the command shown                     |
 | No `5h` / `7d` lines                   | Expected on API-key accounts — those windows only exist for Claude.ai subscriptions         |
-| No per-model line                      | Expected — the CLI does not send `rate_limits.model_scoped` to the status line yet          |
+| No per-model line                      | The plan has no model-scoped window, `curl` is missing, you are on macOS (Keychain), or the first fetch has not landed yet |
 | No `Credits` line                      | Credits are off and nothing was spent, `curl` is missing, or you are on macOS (Keychain)    |
-| `Credits` line says `as of …`          | The last fetch failed or the token expired; it catches up after Claude Code's next request  |
+| `Credits` or per-model line says `as of …` | The last fetch failed or the token expired; it catches up after Claude Code's next request  |
 | Cost and effort level are plain yellow | The terminal does not report truecolor, so the script falls back to ANSI yellow              |
 | Boxes instead of icons                 | The terminal font has no emoji coverage; replace the icons in the `printf` calls            |
 

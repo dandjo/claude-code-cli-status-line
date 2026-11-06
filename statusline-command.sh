@@ -11,32 +11,204 @@
 
 input=$(cat)
 
-# Every field comes out of the payload through jq; without it the line would read all zeros, so it names
-# what is missing instead.
-if ! command -v jq > /dev/null; then
-    printf 'Status line needs jq: apt install jq / brew install jq\n'
+# Every field comes out of the payload through Python; without it the line would read all zeros, so it
+# names what is missing instead.
+if ! command -v python3 > /dev/null; then
+    printf 'Status line needs python3: apt install python3 / xcode-select --install\n'
     exit 0
 fi
 
-MODEL=$(echo "$input" | jq -r '.model.display_name // empty')
-EFFORT=$(echo "$input" | jq -r '.effort.level // empty')
-COST=$(echo "$input" | jq -r '.cost.total_cost_usd // 0')
-PCT=$(echo "$input" | jq -r '.context_window.used_percentage // 0' | cut -d. -f1)
-TOKENS=$(echo "$input" | jq -r '.context_window.total_input_tokens // 0' | cut -d. -f1)
-DURATION_MS=$(echo "$input" | jq -r '.cost.total_duration_ms // 0')
-FIVE_H=$(echo "$input" | jq -r '.rate_limits.five_hour.used_percentage // empty' | cut -d. -f1)
-FIVE_H_RESET=$(echo "$input" | jq -r '.rate_limits.five_hour.resets_at // empty')
-SEVEN_D=$(echo "$input" | jq -r '.rate_limits.seven_day.used_percentage // empty' | cut -d. -f1)
-SEVEN_D_RESET=$(echo "$input" | jq -r '.rate_limits.seven_day.resets_at // empty')
-# Per-model weekly windows, one TAB-separated line each: display_name, percent, resets_at.
-# Not in the documented status-line payload yet (CLI 2.1.263 only sends it on the SDK `get_usage` request,
-# where it is `display_name` + `utilization` 0-100 + ISO 8601 `resets_at`). Both field spellings and both
-# timestamp forms are accepted so the block lights up unchanged once the field arrives.
-MODEL_SCOPED=$(echo "$input" | jq -r '(.rate_limits.model_scoped // [])[]
-    | select(.display_name != null)
-    | [.display_name, ((.used_percentage // .utilization // 0) | floor), (.resets_at // "")] | @tsv' 2>/dev/null)
+# The JSON work of the line, in Python 3.8+ with the standard library only, embedded so the script stays
+# one file to copy. It reads values the way jq -r prints them, numbers as jq 1.7+ writes them.
+#   fields <credits cache>        payload on stdin -> the fields read below, each followed by a NUL byte
+#   token-valid <credentials>     exit 0 while the OAuth access token has not expired
+#   auth-header <credentials>     the curl config line that carries the token, for curl -K - on stdin
+#   credits-cache                 /api/oauth/usage answer on stdin -> the cache document; exit 1 without one
+read -r -d '' STATUSLINE_PY <<'PY'
+import decimal, json, math, sys, time
 
-cwd=$(echo "$input" | jq -r '.workspace.current_dir // empty')
+
+class Num(float):
+    """A JSON number that keeps its literal: jq 1.7+ prints it in decimal notation (1.5E+1 as 15, 1e2 as 1E+2)."""
+
+    def __new__(cls, literal):
+        number = float.__new__(cls, literal)
+        number.literal = literal
+        return number
+
+
+class JqError(Exception):
+    pass
+
+
+def parse(text):
+    return json.loads(text, parse_float=Num)
+
+
+def get(value, path):
+    """jq's .a.b: null through null, an error through anything but an object."""
+    for key in path.split("."):
+        if value is None:
+            return None
+        if not isinstance(value, dict):
+            raise JqError(path)
+        value = value.get(key)
+    return value
+
+
+def alt(value, default):
+    return default if value is None or value is False else value
+
+
+def raw(value):
+    """A value as jq -r prints it."""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, bool) or value is None:
+        return json.dumps(value)
+    if isinstance(value, Num):
+        return str(decimal.Decimal(value.literal))
+    if isinstance(value, (int, float)):
+        return str(value)
+    return json.dumps(value, indent=2, ensure_ascii=False)
+
+
+def floor(value):
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise JqError("floor")
+    return math.floor(value)
+
+
+def tsv(values):
+    """jq's @tsv."""
+    cells = []
+    for value in values:
+        if isinstance(value, (list, dict)):
+            raise JqError("@tsv")
+        if isinstance(value, str):
+            value = value.replace("\\", "\\\\").replace("\t", "\\t").replace("\n", "\\n").replace("\r", "\\r")
+        cells.append("" if value is None else raw(value))
+    return "\t".join(cells)
+
+
+def field(payload, path, default=None):
+    """jq -r '<path> // <default>', or '// empty' without a default; empty where jq stops with an error."""
+    try:
+        value = alt(get(payload, path), default)
+    except JqError:
+        return ""
+    return "" if value is None else raw(value)
+
+
+def model_scoped(payload):
+    """(.rate_limits.model_scoped // [])[] | select(.display_name != null)
+    | [.display_name, ((.used_percentage // .utilization // 0) | floor), (.resets_at // "")] | @tsv"""
+    lines = []
+    try:
+        windows = alt(get(payload, "rate_limits.model_scoped"), [])
+        if isinstance(windows, dict):
+            windows = list(windows.values())
+        elif not isinstance(windows, list):
+            raise JqError("[]")
+        for window in windows:
+            if get(window, "display_name") is None:
+                continue
+            percent = alt(alt(get(window, "used_percentage"), get(window, "utilization")), 0)
+            lines.append(tsv([window["display_name"], floor(percent), alt(get(window, "resets_at"), "")]))
+    except JqError:
+        pass
+    return "\n".join(lines)
+
+
+def credits(path):
+    """[(.is_enabled // false), (.used_credits // 0 | floor), (.monthly_limit // 0 | floor),
+    (.decimal_places // 2), (.currency // "USD"), (.fetched_at // 0)] | @tsv"""
+    try:
+        with open(path, encoding="utf-8") as handle:
+            cache = parse(handle.read())
+        return tsv([
+            alt(get(cache, "is_enabled"), False), floor(alt(get(cache, "used_credits"), 0)),
+            floor(alt(get(cache, "monthly_limit"), 0)), alt(get(cache, "decimal_places"), 2),
+            alt(get(cache, "currency"), "USD"), alt(get(cache, "fetched_at"), 0),
+        ])
+    except (OSError, ValueError, JqError):
+        return ""
+
+
+def oauth(path):
+    with open(path, encoding="utf-8") as handle:
+        return get(parse(handle.read()), "claudeAiOauth")
+
+
+def main(mode, args):
+    if mode == "fields":
+        try:
+            payload = parse(sys.stdin.read())
+        except ValueError:
+            payload = JqError
+        values = []
+        for path, default in (
+            ("model.display_name", None), ("effort.level", None), ("cost.total_cost_usd", 0),
+            ("context_window.used_percentage", 0), ("context_window.total_input_tokens", 0),
+            ("cost.total_duration_ms", 0), ("rate_limits.five_hour.used_percentage", None),
+            ("rate_limits.five_hour.resets_at", None), ("rate_limits.seven_day.used_percentage", None),
+            ("rate_limits.seven_day.resets_at", None),
+        ):
+            values.append("" if payload is JqError else field(payload, path, default))
+        values.append("" if payload is JqError else model_scoped(payload))
+        values.append("" if payload is JqError else field(payload, "workspace.current_dir"))
+        values.append(credits(args[0]) if args else "")
+        sys.stdout.write("".join(value.replace("\0", "").rstrip("\n") + "\0" for value in values))
+        return 0
+    if mode == "token-valid":
+        expires = get(oauth(args[0]), "expiresAt")
+        if isinstance(expires, bool) or expires is None:
+            return 1
+        # jq orders strings, arrays, and objects after every number
+        return 0 if not isinstance(expires, (int, float)) or expires > time.time() * 1000 else 1
+    if mode == "auth-header":
+        token = get(oauth(args[0]), "accessToken")
+        if not isinstance(token, str) or not token:
+            return 1
+        sys.stdout.write('header = "Authorization: Bearer %s"\n' % token.replace("\\", "\\\\").replace('"', '\\"'))
+        return 0
+    if mode == "credits-cache":
+        extra = get(parse(sys.stdin.read()), "extra_usage")
+        if not isinstance(extra, dict):
+            return 1
+        sys.stdout.write(json.dumps({"fetched_at": math.floor(time.time()), **extra}, indent=2, ensure_ascii=False) + "\n")
+        return 0
+    return 2
+
+
+try:
+    sys.exit(main(sys.argv[1], sys.argv[2:]))
+except (OSError, ValueError, JqError, IndexError):
+    sys.exit(1)
+PY
+
+# Usage-credits cache, kept by refresh_credits below and read with the payload fields.
+CREDITS_TTL=120
+CREDITS_STALE=600
+CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/claude-statusline"
+CREDITS_CACHE="$CACHE_DIR/usage-credits.json"
+CREDENTIALS="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/.credentials.json"
+
+# MODEL_SCOPED: the per-model weekly windows, one TAB-separated line each: display_name, percent,
+# resets_at. Not in the documented status-line payload yet (CLI 2.1.263 only sends it on the SDK
+# `get_usage` request, where it is `display_name` + `utilization` 0-100 + ISO 8601 `resets_at`). Both
+# field spellings and both timestamp forms are accepted so the block lights up unchanged once the field
+# arrives. CREDITS: the credits cache as one TAB-separated line, read by render_credits.
+{
+    IFS= read -r -d '' MODEL; IFS= read -r -d '' EFFORT; IFS= read -r -d '' COST
+    IFS= read -r -d '' PCT; IFS= read -r -d '' TOKENS; IFS= read -r -d '' DURATION_MS
+    IFS= read -r -d '' FIVE_H; IFS= read -r -d '' FIVE_H_RESET
+    IFS= read -r -d '' SEVEN_D; IFS= read -r -d '' SEVEN_D_RESET
+    IFS= read -r -d '' MODEL_SCOPED; IFS= read -r -d '' cwd; IFS= read -r -d '' CREDITS
+} < <(printf '%s\n' "$input" | python3 -I -c "$STATUSLINE_PY" fields "$CREDITS_CACHE" 2>/dev/null)
+# Whole numbers only, as the bars and the token count print them
+PCT=${PCT%%.*}; TOKENS=${TOKENS%%.*}; FIVE_H=${FIVE_H%%.*}; SEVEN_D=${SEVEN_D%%.*}
+
 [ -z "$cwd" ] && cwd=$PWD
 
 # Replace $HOME with ~ to mirror bash's \w behavior
@@ -154,21 +326,14 @@ render_bar() {
 # token goes to curl on stdin, never on the command line and never into the cache. An expired token is
 # left alone: refreshing it here would rotate the refresh token behind Claude Code's back. macOS keeps
 # the credentials in the Keychain instead of the file, so the line stays off there.
-CREDITS_TTL=120
-CREDITS_STALE=600
-CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/claude-statusline"
-CREDITS_CACHE="$CACHE_DIR/usage-credits.json"
-CREDENTIALS="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/.credentials.json"
-
 fetch_credits() {
     local tmp
     set -o pipefail
-    jq -e --argjson now "$(($(date +%s) * 1000))" '.claudeAiOauth.expiresAt > $now' "$CREDENTIALS" \
-        > /dev/null 2>&1 || return 0
+    python3 -I -c "$STATUSLINE_PY" token-valid "$CREDENTIALS" > /dev/null 2>&1 || return 0
     tmp=$(mktemp "$CACHE_DIR/.usage.XXXXXX") || return 0
-    if jq -r '"header = \"Authorization: Bearer \(.claudeAiOauth.accessToken)\""' "$CREDENTIALS" \
+    if python3 -I -c "$STATUSLINE_PY" auth-header "$CREDENTIALS" \
         | curl -sf -m 10 -K - -H 'anthropic-beta: oauth-2025-04-20' https://api.anthropic.com/api/oauth/usage \
-        | jq -e '.extra_usage | objects | {fetched_at: (now | floor)} + .' > "$tmp"; then
+        | python3 -I -c "$STATUSLINE_PY" credits-cache > "$tmp"; then
         mv -f "$tmp" "$CREDITS_CACHE"
     else
         rm -f "$tmp"
@@ -205,9 +370,7 @@ render_credits() {
     [ -r "$CREDITS_CACHE" ] || return 0
     # No field may be empty: TAB is IFS whitespace, so `read` would merge an empty one into its neighbour.
     # A monthly limit of 0 therefore stands for "none".
-    IFS=$'\t' read -r enabled used limit places currency fetched < <(jq -r '[
-        (.is_enabled // false), (.used_credits // 0 | floor), (.monthly_limit // 0 | floor),
-        (.decimal_places // 2), (.currency // "USD"), (.fetched_at // 0)] | @tsv' "$CREDITS_CACHE" 2>/dev/null)
+    IFS=$'\t' read -r enabled used limit places currency fetched <<< "$CREDITS"
     [ -z "$enabled" ] && return 0
     [ "$enabled" != true ] && [ "${used:-0}" -eq 0 ] && return 0
 
